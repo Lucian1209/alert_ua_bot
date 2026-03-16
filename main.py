@@ -1,13 +1,14 @@
-
 import os
 import logging
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 
 import httpx
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import BadRequest
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ---------------------------------------------------------------------------
@@ -19,28 +20,24 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-BOT_TOKEN: str = os.environ["BOT_TOKEN"]       # KeyError якщо не задано — краще ніж None
+BOT_TOKEN: str = os.environ["BOT_TOKEN"]
 CHAT_ID: str   = os.environ["CHAT_ID"]
 
 ALERTS_API_URL  = "https://alerts.com.ua/api/states"
-POLL_INTERVAL   = 30        # секунди між запитами
-REQUEST_TIMEOUT = 10        # секунди на HTTP-запит
-MAX_RETRIES     = 3         # кількість спроб при помилці API
-RETRY_DELAY     = 5         # секунди між повторами
+POLL_INTERVAL   = 30
+REQUEST_TIMEOUT = 10
+MAX_RETRIES     = 3
+RETRY_DELAY     = 5
 
 # ---------------------------------------------------------------------------
 # Типи
 # ---------------------------------------------------------------------------
-
-@dataclass(frozen=True, eq=True)
-class RegionState:
-    status: bool
-    alert_type: str
 
 ICONS: dict[str, str] = {
     "AIR":         "🛩️",
@@ -50,18 +47,45 @@ ICONS: dict[str, str] = {
     "UNKNOWN":     "🚨",
 }
 
+@dataclass
+class RegionAlert:
+    """Зберігає стан та message_id для кожного регіону."""
+    active: bool
+    alert_type: str
+    message_id: Optional[int] = None      # ID надісланого повідомлення
+    updates: list[str] = field(default_factory=list)  # список UPD рядків
+
 # ---------------------------------------------------------------------------
 # Стан
 # ---------------------------------------------------------------------------
 
-last_status: dict[str, RegionState] = {}
+region_alerts: dict[str, RegionAlert] = {}
+
+# ---------------------------------------------------------------------------
+# Форматування
+# ---------------------------------------------------------------------------
+
+def now_kyiv() -> str:
+    """Поточний час у форматі HH:MM (UTC+3)."""
+    from datetime import timedelta
+    return (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%H:%M")
+
+
+def format_alert_message(name: str, alert: RegionAlert) -> str:
+    """Формує повідомлення для регіону з усіма UPD."""
+    icon = ICONS.get(alert.alert_type, "🚨")
+    lines = [f"‼️{icon} <b>Тривога у {name}</b>"]
+
+    for upd in alert.updates:
+        lines.append(upd)
+
+    return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
 # API
 # ---------------------------------------------------------------------------
 
 async def fetch_regions(client: httpx.AsyncClient) -> Optional[list[dict]]:
-    """Отримує дані тривог з API. Повертає None при невдачі."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             response = await client.get(ALERTS_API_URL, timeout=REQUEST_TIMEOUT)
@@ -70,7 +94,7 @@ async def fetch_regions(client: httpx.AsyncClient) -> Optional[list[dict]]:
         except httpx.HTTPStatusError as e:
             logger.warning("HTTP %s від API (спроба %d/%d)", e.response.status_code, attempt, MAX_RETRIES)
         except httpx.RequestError as e:
-            logger.warning("Помилка запиту до API: %s (спроба %d/%d)", e, attempt, MAX_RETRIES)
+            logger.warning("Помилка запиту: %s (спроба %d/%d)", e, attempt, MAX_RETRIES)
         except Exception as e:
             logger.error("Несподівана помилка: %s (спроба %d/%d)", e, attempt, MAX_RETRIES)
 
@@ -84,53 +108,80 @@ async def fetch_regions(client: httpx.AsyncClient) -> Optional[list[dict]]:
 # Логіка тривог
 # ---------------------------------------------------------------------------
 
-def build_message(active: list[str]) -> str:
-    if active:
-        return "<b>🚨 Повітряна тривога:</b>\n\n" + "\n".join(active)
-    return "✅ <b>Відбій тривоги по всій Україні</b>"
-
-
 async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Перевіряє тривоги та надсилає повідомлення при змінах."""
-    global last_status
+    global region_alerts
 
     client: httpx.AsyncClient = context.bot_data["http_client"]
     regions = await fetch_regions(client)
     if regions is None:
         return
 
-    active: list[str] = []
-    changed = False
-
     for region in regions:
-        name: str        = region.get("name", "")
-        status: bool     = bool(region.get("alert", False))
-        alert_type: str  = region.get("type", "UNKNOWN")
+        name: str       = region.get("name", "")
+        active: bool    = bool(region.get("alert", False))
+        alert_type: str = region.get("type", "UNKNOWN")
 
         if not name:
             continue
 
-        current = RegionState(status=status, alert_type=alert_type)
+        existing = region_alerts.get(name)
 
-        if last_status.get(name) != current:
-            changed = True
-            last_status[name] = current
+        # --- Нова тривога ---
+        if active and (existing is None or not existing.active):
+            alert = RegionAlert(active=True, alert_type=alert_type)
+            region_alerts[name] = alert
 
-        if status:
+            msg = format_alert_message(name, alert)
+            try:
+                sent = await context.bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=msg,
+                    parse_mode=ParseMode.HTML,
+                )
+                alert.message_id = sent.message_id
+                logger.info("Тривога: %s", name)
+            except Exception as e:
+                logger.error("Помилка надсилання для %s: %s", name, e)
+
+        # --- Відбій ---
+        elif not active and existing and existing.active:
+            t = now_kyiv()
+            existing.active = False
+            existing.updates.append(f"\n✅ <b>UPD {t}:</b> відбій тривоги")
+
+            if existing.message_id:
+                msg = format_alert_message(name, existing)
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=CHAT_ID,
+                        message_id=existing.message_id,
+                        text=msg,
+                        parse_mode=ParseMode.HTML,
+                    )
+                    logger.info("Відбій: %s", name)
+                except BadRequest as e:
+                    logger.warning("Не вдалося редагувати повідомлення для %s: %s", name, e)
+                except Exception as e:
+                    logger.error("Помилка редагування для %s: %s", name, e)
+
+        # --- Зміна типу тривоги (без відбою) ---
+        elif active and existing and existing.active and existing.alert_type != alert_type:
+            t = now_kyiv()
             icon = ICONS.get(alert_type, "🚨")
-            active.append(f"{icon} <b>{name}</b>")
+            existing.alert_type = alert_type
+            existing.updates.append(f"\n🔄 <b>UPD {t}:</b> тип змінився на {icon} {alert_type}")
 
-    if changed:
-        msg = build_message(active)
-        try:
-            await context.bot.send_message(
-                chat_id=CHAT_ID,
-                text=msg,
-                parse_mode=ParseMode.HTML,
-            )
-            logger.info("Надіслано оновлення: %d активних регіонів", len(active))
-        except Exception as e:
-            logger.error("Не вдалося надіслати повідомлення: %s", e)
+            if existing.message_id:
+                msg = format_alert_message(name, existing)
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=CHAT_ID,
+                        message_id=existing.message_id,
+                        text=msg,
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception as e:
+                    logger.error("Помилка редагування типу для %s: %s", name, e)
 
 # ---------------------------------------------------------------------------
 # Команди
@@ -141,17 +192,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Показує поточний стан тривог на запит."""
-    if not last_status:
-        await update.message.reply_text("Дані ще не завантажені, зачекайте...")
-        return
-
     active = [
-        f"{ICONS.get(s.alert_type, '🚨')} <b>{name}</b>"
-        for name, s in last_status.items()
-        if s.status
+        f"{ICONS.get(a.alert_type, '🚨')} <b>{name}</b>"
+        for name, a in region_alerts.items()
+        if a.active
     ]
-    msg = build_message(active)
+    if active:
+        msg = "<b>🚨 Активні тривоги:</b>\n\n" + "\n".join(active)
+    else:
+        msg = "✅ <b>Наразі тривог немає</b>"
+
     await update.message.reply_text(msg, parse_mode=ParseMode.HTML)
 
 # ---------------------------------------------------------------------------
@@ -159,21 +209,17 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ---------------------------------------------------------------------------
 
 async def post_init(application) -> None:
-    """Ініціалізація після старту — створюємо HTTP-клієнт та запускаємо JobQueue."""
     application.bot_data["http_client"] = httpx.AsyncClient()
-
-    # JobQueue замість ручного asyncio.create_task — вбудований механізм PTB
     application.job_queue.run_repeating(
         check_alerts,
         interval=POLL_INTERVAL,
-        first=0,            # перший запит одразу після старту
+        first=0,
         name="alerts_loop",
     )
-    logger.info("Бот запущено. Інтервал перевірки: %ds", POLL_INTERVAL)
+    logger.info("Бот запущено. Інтервал: %ds", POLL_INTERVAL)
 
 
 async def post_shutdown(application) -> None:
-    """Закриває HTTP-клієнт при зупинці."""
     client: httpx.AsyncClient = application.bot_data.get("http_client")
     if client:
         await client.aclose()
@@ -200,3 +246,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
