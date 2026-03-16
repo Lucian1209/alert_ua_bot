@@ -1,6 +1,7 @@
 import os
 import requests
-from telegram import Bot, ParseMode
+from telegram import Bot, Update
+from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram import Update
 
