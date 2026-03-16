@@ -67,6 +67,9 @@ alert_message_id: Optional[int] = None
 # Лог змін для UPD рядків
 upd_log: list[str] = []
 
+# Перший запуск — не пишемо UPD щоб не спамити
+is_first_run: bool = True
+
 # ---------------------------------------------------------------------------
 # Утіліти
 # ---------------------------------------------------------------------------
@@ -156,7 +159,7 @@ async def send_or_edit(bot) -> None:
 # ---------------------------------------------------------------------------
 
 async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
-    global active_regions, upd_log
+    global active_regions, upd_log, is_first_run
 
     client: httpx.AsyncClient = context.bot_data["http_client"]
     states = await fetch_alerts(client)
@@ -169,29 +172,54 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
         if params.get("alertnow")
     }
 
-    changed = False
+    # Перший запуск — просто зберігаємо стан і надсилаємо повідомлення без UPD
+    if is_first_run:
+        is_first_run = False
+        active_regions = new_active
+        if active_regions:
+            await send_or_edit(context.bot)
+        return
+
     t = now_kyiv()
 
-    # Нові тривоги
-    for name, alert_type in new_active.items():
-        if name not in active_regions:
+    # Нові тривоги — групуємо в один UPD якщо кілька одночасно
+    new_alerts = [name for name in new_active if name not in active_regions]
+    if new_alerts:
+        if len(new_alerts) == 1:
+            name = new_alerts[0]
+            alert_type = new_active[name]
             icon = ICONS.get(alert_type, "🚨")
-            label = ALERT_LABELS.get(alert_type, alert_type)
-            upd_log.append(f"⚠️ <b>UPD {t}:</b> тривога — {icon} {name} ({label})")
-            logger.info("🚨 Тривога: %s (%s)", name, alert_type)
-            changed = True
-        elif active_regions[name] != alert_type:
-            icon = ICONS.get(alert_type, "🚨")
-            label = ALERT_LABELS.get(alert_type, alert_type)
-            upd_log.append(f"🔄 <b>UPD {t}:</b> зміна типу — {icon} {name} ({label})")
-            changed = True
+            label = ALERT_LABELS.get(alert_type, "")
+            type_str = f" ({label})" if label and alert_type != "UNKNOWN" else ""
+            upd_log.append(f"⚠️ <b>UPD {t}:</b> тривога — {icon} {name}{type_str}")
+        else:
+            names_str = ", ".join(sorted(new_alerts))
+            upd_log.append(f"⚠️ <b>UPD {t}:</b> тривога — {len(new_alerts)} областей: {names_str}")
+        for name in new_alerts:
+            logger.info("🚨 Тривога: %s (%s)", name, new_active[name])
 
-    # Відбій
-    for name in list(active_regions):
-        if name not in new_active:
-            upd_log.append(f"✅ <b>UPD {t}:</b> відбій — {name}")
+    # Зміна типу
+    for name, alert_type in new_active.items():
+        if name in active_regions and active_regions[name] != alert_type and alert_type != "UNKNOWN":
+            icon = ICONS.get(alert_type, "🚨")
+            label = ALERT_LABELS.get(alert_type, alert_type)
+            upd_log.append(f"🔄 <b>UPD {t}:</b> {icon} {name} — {label}")
+
+    # Відбій — теж групуємо
+    cleared = [name for name in active_regions if name not in new_active]
+    if cleared:
+        if len(cleared) == 1:
+            upd_log.append(f"✅ <b>UPD {t}:</b> відбій — {cleared[0]}")
+        else:
+            names_str = ", ".join(sorted(cleared))
+            upd_log.append(f"✅ <b>UPD {t}:</b> відбій — {len(cleared)} областей: {names_str}")
+        for name in cleared:
             logger.info("✅ Відбій: %s", name)
-            changed = True
+
+    changed = bool(new_alerts or cleared or any(
+        name in active_regions and active_regions[name] != t2 and t2 != "UNKNOWN"
+        for name, t2 in new_active.items()
+    ))
 
     if changed:
         active_regions = new_active
