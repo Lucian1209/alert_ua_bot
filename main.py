@@ -1,7 +1,6 @@
 import os
 import logging
 import asyncio
-from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -29,15 +28,14 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 BOT_TOKEN: str = os.environ["BOT_TOKEN"]
 CHAT_ID: str   = os.environ["CHAT_ID"]
 
-# https://wiki.ubilling.net.ua/doku.php?id=aerialalertsapi
-ALERTS_API_URL  = "https://ubilling.net.ua/aerialalerts/"
-POLL_INTERVAL   = 5    # секунди (API кешує 3с, ліміт 2 rps)
+ALERTS_API_URL  = "https://ubilling.net.ua/aerialalerts/?source=aiu"
+POLL_INTERVAL   = 5
 REQUEST_TIMEOUT = 10
 MAX_RETRIES     = 3
 RETRY_DELAY     = 5
 
 # ---------------------------------------------------------------------------
-# Типи
+# Іконки
 # ---------------------------------------------------------------------------
 
 ICONS: dict[str, str] = {
@@ -48,18 +46,26 @@ ICONS: dict[str, str] = {
     "UNKNOWN":     "🚨",
 }
 
-@dataclass
-class RegionAlert:
-    active: bool
-    alert_type: str
-    message_id: Optional[int] = None
-    updates: list[str] = field(default_factory=list)
+ALERT_LABELS: dict[str, str] = {
+    "AIR":         "авіація",
+    "ARTILLERY":   "артилерія",
+    "DRONE":       "БПЛА",
+    "URBAN_FIGHT": "вуличні бої",
+    "UNKNOWN":     "невідома загроза",
+}
 
 # ---------------------------------------------------------------------------
 # Стан
 # ---------------------------------------------------------------------------
 
-region_alerts: dict[str, RegionAlert] = {}
+# Поточні активні регіони: { name: alert_type }
+active_regions: dict[str, str] = {}
+
+# ID єдиного повідомлення з тривогами
+alert_message_id: Optional[int] = None
+
+# Лог змін для UPD рядків
+upd_log: list[str] = []
 
 # ---------------------------------------------------------------------------
 # Утіліти
@@ -69,10 +75,21 @@ def now_kyiv() -> str:
     return (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%H:%M")
 
 
-def format_message(name: str, alert: RegionAlert) -> str:
-    icon = ICONS.get(alert.alert_type, "🚨")
-    lines = [f"‼️{icon} <b>Тривога у {name}</b>"]
-    lines.extend(alert.updates)
+def build_message() -> str:
+    lines = []
+
+    if active_regions:
+        lines.append("<b>🚨 Активні тривоги:</b>\n")
+        for name, alert_type in sorted(active_regions.items()):
+            icon = ICONS.get(alert_type, "🚨")
+            lines.append(f"{icon} {name}")
+    else:
+        lines.append("✅ <b>Тривог немає</b>")
+
+    if upd_log:
+        lines.append("")
+        lines.extend(upd_log)
+
     return "\n".join(lines)
 
 # ---------------------------------------------------------------------------
@@ -80,11 +97,6 @@ def format_message(name: str, alert: RegionAlert) -> str:
 # ---------------------------------------------------------------------------
 
 async def fetch_alerts(client: httpx.AsyncClient) -> Optional[dict]:
-    """
-    Повертає словник виду:
-      { "Київська область": {"alertnow": True, "type": "DRONE", ...}, ... }
-    або None при помилці.
-    """
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             response = await client.get(ALERTS_API_URL, timeout=REQUEST_TIMEOUT)
@@ -105,76 +117,85 @@ async def fetch_alerts(client: httpx.AsyncClient) -> Optional[dict]:
     return None
 
 # ---------------------------------------------------------------------------
+# Надсилання / редагування повідомлення
+# ---------------------------------------------------------------------------
+
+async def send_or_edit(bot) -> None:
+    global alert_message_id
+
+    text = build_message()
+
+    if alert_message_id is None:
+        try:
+            sent = await bot.send_message(
+                chat_id=CHAT_ID,
+                text=text,
+                parse_mode=ParseMode.HTML,
+            )
+            alert_message_id = sent.message_id
+        except Exception as e:
+            logger.error("Помилка надсилання: %s", e)
+    else:
+        try:
+            await bot.edit_message_text(
+                chat_id=CHAT_ID,
+                message_id=alert_message_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+            )
+        except BadRequest as e:
+            if "Message is not modified" in str(e):
+                pass  # нічого не змінилось — ок
+            else:
+                logger.warning("Не вдалося редагувати: %s", e)
+        except Exception as e:
+            logger.error("Помилка редагування: %s", e)
+
+# ---------------------------------------------------------------------------
 # Логіка тривог
 # ---------------------------------------------------------------------------
 
 async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
-    global region_alerts
+    global active_regions, upd_log
 
     client: httpx.AsyncClient = context.bot_data["http_client"]
     states = await fetch_alerts(client)
     if states is None:
         return
 
-    for name, params in states.items():
-        active: bool    = bool(params.get("alertnow", False))
-        alert_type: str = params.get("type", "UNKNOWN") or "UNKNOWN"
+    new_active: dict[str, str] = {
+        name: (params.get("type") or "UNKNOWN")
+        for name, params in states.items()
+        if params.get("alertnow")
+    }
 
-        existing = region_alerts.get(name)
+    changed = False
+    t = now_kyiv()
 
-        # --- Нова тривога ---
-        if active and (existing is None or not existing.active):
-            alert = RegionAlert(active=True, alert_type=alert_type)
-            region_alerts[name] = alert
-
-            try:
-                sent = await context.bot.send_message(
-                    chat_id=CHAT_ID,
-                    text=format_message(name, alert),
-                    parse_mode=ParseMode.HTML,
-                )
-                alert.message_id = sent.message_id
-                logger.info("🚨 Тривога: %s (%s)", name, alert_type)
-            except Exception as e:
-                logger.error("Помилка надсилання для %s: %s", name, e)
-
-        # --- Відбій ---
-        elif not active and existing and existing.active:
-            t = now_kyiv()
-            existing.active = False
-            existing.updates.append(f"\n✅ <b>UPD {t}:</b> відбій тривоги")
-
-            if existing.message_id:
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=CHAT_ID,
-                        message_id=existing.message_id,
-                        text=format_message(name, existing),
-                        parse_mode=ParseMode.HTML,
-                    )
-                    logger.info("✅ Відбій: %s", name)
-                except BadRequest as e:
-                    logger.warning("Не вдалося редагувати повідомлення для %s: %s", name, e)
-                except Exception as e:
-                    logger.error("Помилка редагування для %s: %s", name, e)
-
-        # --- Зміна типу тривоги ---
-        elif active and existing and existing.active and existing.alert_type != alert_type:
-            t = now_kyiv()
+    # Нові тривоги
+    for name, alert_type in new_active.items():
+        if name not in active_regions:
             icon = ICONS.get(alert_type, "🚨")
-            existing.alert_type = alert_type
-            existing.updates.append(f"\n🔄 <b>UPD {t}:</b> тип змінився — {icon} {alert_type}")
+            label = ALERT_LABELS.get(alert_type, alert_type)
+            upd_log.append(f"⚠️ <b>UPD {t}:</b> тривога — {icon} {name} ({label})")
+            logger.info("🚨 Тривога: %s (%s)", name, alert_type)
+            changed = True
+        elif active_regions[name] != alert_type:
+            icon = ICONS.get(alert_type, "🚨")
+            label = ALERT_LABELS.get(alert_type, alert_type)
+            upd_log.append(f"🔄 <b>UPD {t}:</b> зміна типу — {icon} {name} ({label})")
+            changed = True
 
-            if existing.message_id:
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=CHAT_ID,
-                        message_id=existing.message_id,
-                        text=format_message(name, existing),
-                        parse_mode=ParseMode.HTML,
-                    )
-                except Exception as e:
-                    logger.error("Помилка редагування типу для %s: %s", name, e)
+    # Відбій
+    for name in list(active_regions):
+        if name not in new_active:
+            upd_log.append(f"✅ <b>UPD {t}:</b> відбій — {name}")
+            logger.info("✅ Відбій: %s", name)
+            changed = True
+
+    if changed:
+        active_regions = new_active
+        await send_or_edit(context.bot)
 
 # ---------------------------------------------------------------------------
 # Команди
@@ -185,13 +206,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    active = [
-        f"{ICONS.get(a.alert_type, '🚨')} <b>{name}</b>"
-        for name, a in region_alerts.items()
-        if a.active
-    ]
-    if active:
-        msg = "<b>🚨 Активні тривоги:</b>\n\n" + "\n".join(active)
+    if active_regions:
+        lines = ["<b>🚨 Активні тривоги:</b>\n"]
+        for name, alert_type in sorted(active_regions.items()):
+            icon = ICONS.get(alert_type, "🚨")
+            lines.append(f"{icon} {name}")
+        msg = "\n".join(lines)
     else:
         msg = "✅ <b>Наразі тривог немає</b>"
 
@@ -239,4 +259,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
