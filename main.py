@@ -1,23 +1,20 @@
+
 import os
 import requests
-from telegram import Bot, Update
+import asyncio
+
+from telegram import Bot
 from telegram.constants import ParseMode
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
-from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-# ===========================
-# Налаштування
-# ===========================
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-bot = Bot(token=BOT_TOKEN)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
-# ===========================
-# Кеш останнього стану
-# ===========================
-last_status = {}  # region_name -> {status, threat, type}
+bot = Bot(BOT_TOKEN)
 
-# Іконки для типів тривоги
+# кеш стану
+last_status = {}
+
 ICONS = {
     "AIR": "🛩️",
     "ARTILLERY": "💣",
@@ -26,91 +23,82 @@ ICONS = {
     "UNKNOWN": "🚨"
 }
 
-# ===========================
-# Очистка кешу при старті
-# ===========================
-def clear_cache():
-    global last_status
-    last_status = {}
-    print("Кеш очищено!")
+# -----------------------------
 
-# ===========================
-# Команда /start
-# ===========================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Бот увімкнено! Тривоги надходитимуть лише при зміні стану."
-    )
+async def start(update, context):
+    await update.message.reply_text("Бот тривог запущено 🚨")
 
-# ===========================
-# Основна функція перевірки тривог
-# ===========================
+# -----------------------------
+
 async def check_alerts():
+
     global last_status
+
     try:
-        response = requests.get("https://alerts.com.ua/api/states")
-        regions = response.json()
-    except Exception as e:
-        print("Помилка при отриманні API:", e)
+        r = requests.get("https://alerts.com.ua/api/states")
+        regions = r.json()
+    except:
+        print("API error")
         return
 
-    active_alerts = []
+    active = []
     changed = False
 
     for region in regions:
-        region_name = region.get("name")
+
+        name = region.get("name")
         status = region.get("alert", False)
         alert_type = region.get("type", "UNKNOWN")
-        threat_detail = region.get("threat", "")
-        icon = ICONS.get(alert_type, ICONS["UNKNOWN"])
 
-        current_status = {"status": status, "threat": threat_detail, "type": alert_type}
+        current = {
+            "status": status,
+            "type": alert_type
+        }
 
-        if last_status.get(region_name) != current_status:
-            last_status[region_name] = current_status
+        if last_status.get(name) != current:
             changed = True
+            last_status[name] = current
 
         if status:
-            threat_text = f" — {threat_detail}" if threat_detail else ""
-            # Форматування жирним та емодзі
-            active_alerts.append(f"{icon} <b>{region_name}</b> ({alert_type}){threat_text}")
+            icon = ICONS.get(alert_type, "🚨")
+            active.append(f"{icon} <b>{name}</b>")
 
     if changed:
-        if active_alerts:
-            message = "<b>🚨 Активні повітряні тривоги:</b>\n" + "\n".join(active_alerts)
+
+        if active:
+            msg = "<b>🚨 Повітряна тривога:</b>\n\n" + "\n".join(active)
         else:
-            message = "✅ <b>Всі тривоги відбій</b>"
+            msg = "✅ <b>Відбій тривоги по всій Україні</b>"
 
-        try:
-            await bot.send_message(chat_id=CHAT_ID, text=message, parse_mode=ParseMode.HTML)
-        except Exception as e:
-            print("Помилка відправки:", e)
+        await bot.send_message(
+            chat_id=CHAT_ID,
+            text=msg,
+            parse_mode=ParseMode.HTML
+        )
 
-# ===========================
-# Webhook обробник для JustRunMy.App
-# ===========================
-async def alerts_webhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Викликається через cron або POST на /alerts
-    await check_alerts()
+# -----------------------------
 
-# ===========================
-# Запуск бота
-# ===========================
+async def alerts_loop():
+
+    while True:
+
+        await check_alerts()
+
+        await asyncio.sleep(30)
+
+# -----------------------------
+
 async def main():
-    clear_cache()
+
     application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Команда /start
     application.add_handler(CommandHandler("start", start))
 
-    # Webhook endpoint
-    application.add_handler(MessageHandler(filters.ALL, alerts_webhook))
+    asyncio.create_task(alerts_loop())
 
-    # Запуск бота
-    await application.start()
-    await application.updater.start_polling()
-    await application.idle()
+    await application.run_polling()
+
+# -----------------------------
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
