@@ -54,8 +54,8 @@ class AlertWave:
 # Стан
 # ---------------------------------------------------------------------------
 
-# Поточні активні хвилі: остання активна хвиля
-current_wave: Optional[AlertWave] = None
+# Поточні активні хвилі (повідомлення): список хвиль, які ще можуть отримати оновлення
+waves: list[AlertWave] = []
 
 # Всі активні регіони прямо зараз
 active_regions: set[str] = set()
@@ -149,7 +149,7 @@ async def edit_wave(bot, wave: AlertWave) -> None:
 # ---------------------------------------------------------------------------
 
 async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
-    global current_wave, active_regions, is_first_run
+    global waves, active_regions, is_first_run
 
     client: httpx.AsyncClient = context.bot_data["http_client"]
     states = await fetch_alerts(client)
@@ -175,17 +175,19 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
     new_alerts = new_active - active_regions
     if new_alerts:
         # Чи є активна хвиля в межах вікна?
-        wave_age = (now - current_wave.started_at).total_seconds() if current_wave else float("inf")
+        last_wave = waves[-1] if waves else None
+        wave_age = (now - last_wave.started_at).total_seconds() if last_wave else float("inf")
 
-        if current_wave and wave_age <= WAVE_WINDOW_SEC:
+        if last_wave and wave_age <= WAVE_WINDOW_SEC:
             # Додаємо до поточної хвилі
-            current_wave.regions |= new_alerts
-            await edit_wave(context.bot, current_wave)
+            last_wave.regions |= new_alerts
+            await edit_wave(context.bot, last_wave)
             logger.info("➕ Додано до хвилі: %s", sorted(new_alerts))
         else:
             # Нова хвиля
-            current_wave = AlertWave(regions=set(new_alerts))
-            await send_wave(context.bot, current_wave)
+            new_wave = AlertWave(regions=set(new_alerts))
+            waves.append(new_wave)
+            await send_wave(context.bot, new_wave)
             logger.info("🌊 Нова хвиля: %s", sorted(new_alerts))
 
     # Відбій
@@ -194,9 +196,11 @@ async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
         for name in cleared:
             logger.info("✅ Відбій: %s", name)
             # Знаходимо хвилю де була ця область
-            if current_wave and name in current_wave.regions and name not in current_wave.cleared:
-                current_wave.cleared[name] = t
-                await edit_wave(context.bot, current_wave)
+            for wave in waves:
+                if name in wave.regions and name not in wave.cleared:
+                    wave.cleared[name] = t
+                    await edit_wave(context.bot, wave)
+                    break
 
     active_regions = new_active
 
