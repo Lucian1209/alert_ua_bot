@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -28,46 +29,38 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 BOT_TOKEN: str = os.environ["BOT_TOKEN"]
 CHAT_ID: str   = os.environ["CHAT_ID"]
 
-ALERTS_API_URL  = "https://ubilling.net.ua/aerialalerts/?source=aiu"
+ALERTS_API_URL  = "https://ubilling.net.ua/aerialalerts/"
 POLL_INTERVAL   = 5
 REQUEST_TIMEOUT = 10
 MAX_RETRIES     = 3
 RETRY_DELAY     = 5
 
+# Якщо нові тривоги прийшли протягом N секунд після попередніх — це одна хвиля
+WAVE_WINDOW_SEC = 15
+
 # ---------------------------------------------------------------------------
-# Іконки
+# Типи
 # ---------------------------------------------------------------------------
 
-ICONS: dict[str, str] = {
-    "AIR":         "🛩️",
-    "ARTILLERY":   "💣",
-    "DRONE":       "🛰️",
-    "URBAN_FIGHT": "⚔️",
-    "UNKNOWN":     "🚨",
-}
-
-ALERT_LABELS: dict[str, str] = {
-    "AIR":         "авіація",
-    "ARTILLERY":   "артилерія",
-    "DRONE":       "БПЛА",
-    "URBAN_FIGHT": "вуличні бої",
-    "UNKNOWN":     "невідома загроза",
-}
+@dataclass
+class AlertWave:
+    """Одна хвиля тривог — одне повідомлення в чаті."""
+    regions: set[str]                        # області цієї хвилі
+    message_id: Optional[int] = None         # ID повідомлення в Telegram
+    cleared: dict[str, str] = field(default_factory=dict)  # { region: time }
+    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 # ---------------------------------------------------------------------------
 # Стан
 # ---------------------------------------------------------------------------
 
-# Поточні активні регіони: { name: alert_type }
-active_regions: dict[str, str] = {}
+# Поточні активні хвилі: остання активна хвиля
+current_wave: Optional[AlertWave] = None
 
-# ID єдиного повідомлення з тривогами
-alert_message_id: Optional[int] = None
+# Всі активні регіони прямо зараз
+active_regions: set[str] = set()
 
-# Лог змін для UPD рядків
-upd_log: list[str] = []
-
-# Перший запуск — не пишемо UPD щоб не спамити
+# Перший запуск
 is_first_run: bool = True
 
 # ---------------------------------------------------------------------------
@@ -78,20 +71,19 @@ def now_kyiv() -> str:
     return (datetime.now(timezone.utc) + timedelta(hours=3)).strftime("%H:%M")
 
 
-def build_message() -> str:
-    lines = []
+def build_wave_message(wave: AlertWave) -> str:
+    lines = ["<b>🚨 Повітряна тривога:</b>\n"]
 
-    if active_regions:
-        lines.append("<b>🚨 Активні тривоги:</b>\n")
-        for name, alert_type in sorted(active_regions.items()):
-            icon = ICONS.get(alert_type, "🚨")
-            lines.append(f"{icon} {name}")
-    else:
-        lines.append("✅ <b>Тривог немає</b>")
+    for name in sorted(wave.regions):
+        if name in wave.cleared:
+            lines.append(f"✅ <s>{name}</s>")
+        else:
+            lines.append(f"🚨 {name}")
 
-    if upd_log:
+    if wave.cleared:
         lines.append("")
-        lines.extend(upd_log)
+        for name, t in sorted(wave.cleared.items(), key=lambda x: x[1]):
+            lines.append(f"✅ <b>UPD {t}:</b> відбій — {name}")
 
     return "\n".join(lines)
 
@@ -120,110 +112,93 @@ async def fetch_alerts(client: httpx.AsyncClient) -> Optional[dict]:
     return None
 
 # ---------------------------------------------------------------------------
-# Надсилання / редагування повідомлення
+# Надсилання / редагування
 # ---------------------------------------------------------------------------
 
-async def send_or_edit(bot) -> None:
-    global alert_message_id
+async def send_wave(bot, wave: AlertWave) -> None:
+    try:
+        sent = await bot.send_message(
+            chat_id=CHAT_ID,
+            text=build_wave_message(wave),
+            parse_mode=ParseMode.HTML,
+        )
+        wave.message_id = sent.message_id
+        logger.info("📨 Надіслано хвилю: %s", sorted(wave.regions))
+    except Exception as e:
+        logger.error("Помилка надсилання: %s", e)
 
-    text = build_message()
 
-    if alert_message_id is None:
-        try:
-            sent = await bot.send_message(
-                chat_id=CHAT_ID,
-                text=text,
-                parse_mode=ParseMode.HTML,
-            )
-            alert_message_id = sent.message_id
-        except Exception as e:
-            logger.error("Помилка надсилання: %s", e)
-    else:
-        try:
-            await bot.edit_message_text(
-                chat_id=CHAT_ID,
-                message_id=alert_message_id,
-                text=text,
-                parse_mode=ParseMode.HTML,
-            )
-        except BadRequest as e:
-            if "Message is not modified" in str(e):
-                pass  # нічого не змінилось — ок
-            else:
-                logger.warning("Не вдалося редагувати: %s", e)
-        except Exception as e:
-            logger.error("Помилка редагування: %s", e)
+async def edit_wave(bot, wave: AlertWave) -> None:
+    if wave.message_id is None:
+        return
+    try:
+        await bot.edit_message_text(
+            chat_id=CHAT_ID,
+            message_id=wave.message_id,
+            text=build_wave_message(wave),
+            parse_mode=ParseMode.HTML,
+        )
+    except BadRequest as e:
+        if "Message is not modified" not in str(e):
+            logger.warning("Не вдалося редагувати: %s", e)
+    except Exception as e:
+        logger.error("Помилка редагування: %s", e)
 
 # ---------------------------------------------------------------------------
 # Логіка тривог
 # ---------------------------------------------------------------------------
 
 async def check_alerts(context: ContextTypes.DEFAULT_TYPE) -> None:
-    global active_regions, upd_log, is_first_run
+    global current_wave, active_regions, is_first_run
 
     client: httpx.AsyncClient = context.bot_data["http_client"]
     states = await fetch_alerts(client)
     if states is None:
         return
 
-    new_active: dict[str, str] = {
-        name: (params.get("type") or "UNKNOWN")
-        for name, params in states.items()
+    new_active: set[str] = {
+        name for name, params in states.items()
         if params.get("alertnow")
     }
 
-    # Перший запуск — просто зберігаємо стан і надсилаємо повідомлення без UPD
+    # Перший запуск — мовчки запам'ятовуємо стан
     if is_first_run:
         is_first_run = False
         active_regions = new_active
-        if active_regions:
-            await send_or_edit(context.bot)
+        logger.info("Початковий стан: %d активних областей", len(active_regions))
         return
 
     t = now_kyiv()
+    now = datetime.now(timezone.utc)
 
-    # Нові тривоги — групуємо в один UPD якщо кілька одночасно
-    new_alerts = [name for name in new_active if name not in active_regions]
+    # Нові тривоги
+    new_alerts = new_active - active_regions
     if new_alerts:
-        if len(new_alerts) == 1:
-            name = new_alerts[0]
-            alert_type = new_active[name]
-            icon = ICONS.get(alert_type, "🚨")
-            label = ALERT_LABELS.get(alert_type, "")
-            type_str = f" ({label})" if label and alert_type != "UNKNOWN" else ""
-            upd_log.append(f"⚠️ <b>UPD {t}:</b> тривога — {icon} {name}{type_str}")
+        # Чи є активна хвиля в межах вікна?
+        wave_age = (now - current_wave.started_at).total_seconds() if current_wave else float("inf")
+
+        if current_wave and wave_age <= WAVE_WINDOW_SEC:
+            # Додаємо до поточної хвилі
+            current_wave.regions |= new_alerts
+            await edit_wave(context.bot, current_wave)
+            logger.info("➕ Додано до хвилі: %s", sorted(new_alerts))
         else:
-            names_str = ", ".join(sorted(new_alerts))
-            upd_log.append(f"⚠️ <b>UPD {t}:</b> тривога — {len(new_alerts)} областей: {names_str}")
-        for name in new_alerts:
-            logger.info("🚨 Тривога: %s (%s)", name, new_active[name])
+            # Нова хвиля
+            current_wave = AlertWave(regions=set(new_alerts))
+            await send_wave(context.bot, current_wave)
+            logger.info("🌊 Нова хвиля: %s", sorted(new_alerts))
 
-    # Зміна типу
-    for name, alert_type in new_active.items():
-        if name in active_regions and active_regions[name] != alert_type and alert_type != "UNKNOWN":
-            icon = ICONS.get(alert_type, "🚨")
-            label = ALERT_LABELS.get(alert_type, alert_type)
-            upd_log.append(f"🔄 <b>UPD {t}:</b> {icon} {name} — {label}")
-
-    # Відбій — теж групуємо
-    cleared = [name for name in active_regions if name not in new_active]
+    # Відбій
+    cleared = active_regions - new_active
     if cleared:
-        if len(cleared) == 1:
-            upd_log.append(f"✅ <b>UPD {t}:</b> відбій — {cleared[0]}")
-        else:
-            names_str = ", ".join(sorted(cleared))
-            upd_log.append(f"✅ <b>UPD {t}:</b> відбій — {len(cleared)} областей: {names_str}")
         for name in cleared:
             logger.info("✅ Відбій: %s", name)
+            # Знаходимо хвилю де була ця область
+            if current_wave and name in current_wave.regions and name not in current_wave.cleared:
+                current_wave.cleared[name] = t
+                await edit_wave(context.bot, current_wave)
 
-    changed = bool(new_alerts or cleared or any(
-        name in active_regions and active_regions[name] != t2 and t2 != "UNKNOWN"
-        for name, t2 in new_active.items()
-    ))
-
-    if changed:
-        active_regions = new_active
-        await send_or_edit(context.bot)
+    active_regions = new_active
 
 # ---------------------------------------------------------------------------
 # Команди
@@ -236,9 +211,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if active_regions:
         lines = ["<b>🚨 Активні тривоги:</b>\n"]
-        for name, alert_type in sorted(active_regions.items()):
-            icon = ICONS.get(alert_type, "🚨")
-            lines.append(f"{icon} {name}")
+        for name in sorted(active_regions):
+            lines.append(f"🚨 {name}")
         msg = "\n".join(lines)
     else:
         msg = "✅ <b>Наразі тривог немає</b>"
